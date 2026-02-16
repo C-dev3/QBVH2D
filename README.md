@@ -216,7 +216,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Support
 
-- Report bugs via [GitHub Issues](https://github.com/yourusername/QBVH2D/issues)
+- Report bugs via [GitHub Issues](https://github.com/C-dev3/QBVH2D/issues)
 
 ## Acknowledgments
 
