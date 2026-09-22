@@ -25,14 +25,14 @@ public class QBVH2d
     /// reclaiming their array slot. Reset to 0 by <see cref="Build{T}"/>/<see cref="Rebuild{T}"/>,
     /// since a freshly built tree has no garbage. See <see cref="GarbageRatio"/>.
     /// </summary>
-    internal int GarbageNodeCount { get; set; }
+    public int GarbageNodeCount { get; set; }
 
     /// <summary>
     /// The fraction of <see cref="NodeCount"/> that is currently orphaned garbage (see
     /// <see cref="GarbageNodeCount"/>). Callers that Remove a lot can poll this to decide when a
     /// <see cref="Rebuild{T}"/> is worth its O(n log n) cost to reclaim the wasted space.
     /// </summary>
-    internal float GarbageRatio => NodeCount == 0 ? 0f : (float)GarbageNodeCount / NodeCount;
+    public float GarbageRatio => NodeCount == 0 ? 0f : (float)GarbageNodeCount / NodeCount;
 
     /// <summary>
     /// When the whole tree is a single shape, its index - direct-encoded here instead of in a
