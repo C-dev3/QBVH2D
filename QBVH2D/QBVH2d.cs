@@ -10,7 +10,16 @@ namespace QBVH2D;
 public class QBVH2d
 {
     internal QBVH2dNode[] Nodes { get; set; }
-    internal int NodeCount { get; set; }
+
+    /// <summary>
+    /// Number of nodes currently in the tree. Valid node indices are in range [0, NodeCount).
+    /// </summary>
+    public int NodeCount { get; internal set; }
+
+    /// <summary>
+    /// 
+    /// </summary>
+    public const int RootIndex = 0;
 
     /// <summary>
     /// Creates an empty QBVH2D
@@ -67,6 +76,17 @@ public class QBVH2d
             NodeCount = nodeCount,
         };
     }
+
+    /// <summary>
+    /// Gets a read-only view of the node at the given index, for custom traversals that the
+    /// built-in Query* methods don't cover (e.g. k-nearest-neighbor / best-first search, queries
+    /// against custom shapes, debug visualization, or tree statistics). Start from
+    /// <see cref="RootIndex"/> and use <see cref="QBVHNodeView.GetChildIndex"/> to descend.
+    /// </summary>
+    /// <param name="index">Node index, in range [0, NodeCount)</param>
+    /// <returns>A read-only view of the node</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public QBVHNodeView GetNode(int index) => new(Nodes[index]);
 
     /// <summary>
     /// Creates an iterator that traverses shapes containing the given point
