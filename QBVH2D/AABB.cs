@@ -51,6 +51,15 @@ public struct AABB
     }
 
     /// <summary>
+    /// Returns the smallest AABB that encloses both <paramref name="a"/> and <paramref name="b"/>.
+    /// Safe to call with <see cref="Empty"/> as either operand: because <see cref="Empty"/> is
+    /// (+Infinity, +Infinity) - (-Infinity, -Infinity), unioning it with any real AABB returns
+    /// that AABB unchanged.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static AABB Union(in AABB a, in AABB b) => new(Vector2.Min(a.Min, b.Min), Vector2.Max(a.Max, b.Max));
+
+    /// <summary>
     /// Grows the AABB to include a point in-place
     /// </summary>
     /// <param name="point"></param>

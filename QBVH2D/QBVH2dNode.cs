@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -126,7 +127,7 @@ internal struct QBVH2dNode
     /// encoded value: a node index is always &gt;= 0, and a leaf encoding (~shapeIndex) never
     /// reaches <see cref="int.MinValue"/> for any realistic shape count.
     /// </summary>
-    private const int NoChild = int.MinValue;
+    internal const int NoChild = int.MinValue;
 
     /// <summary>
     /// Writes one child slot from an encoded value produced by <see cref="Build"/>:
@@ -181,7 +182,7 @@ internal struct QBVH2dNode
     /// larger) when it's too small. No-op when the array already has enough room.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void EnsureCapacity(ref QBVH2dNode[] nodes, int requiredCount)
+    internal static void EnsureCapacity(ref QBVH2dNode[] nodes, int requiredCount)
     {
         if (requiredCount <= nodes.Length) return;
 
@@ -410,5 +411,125 @@ internal struct QBVH2dNode
         );
 
         return nodeIndex;
+    }
+
+    /// <summary>
+    /// Sets child slot <paramref name="slot"/> to a direct-encoded leaf holding
+    /// <paramref name="shapeIndex"/>, with bounds <paramref name="bounds"/>. Used by
+    /// <see cref="QBVH2d.Insert{T}"/> to place a new shape into a previously-empty slot.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void SetChildLeaf(int slot, int shapeIndex, in AABB bounds)
+    {
+        SetChildFlag(slot);
+        SetChildLeafFlag(slot);
+        SetChildIndex(slot, shapeIndex);
+        SetChildBounds(slot, in bounds);
+    }
+
+    /// <summary>
+    /// Sets child slot <paramref name="slot"/> to point at internal node
+    /// <paramref name="nodeIndex"/>, with bounds <paramref name="bounds"/> (the joint bounds of
+    /// that subtree). Clears the slot's leaf flag if it was previously a direct-encoded leaf.
+    /// Used by <see cref="QBVH2d.Insert{T}"/> when promoting a leaf slot into a new 2-child
+    /// subtree holding the old and new leaves.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void SetChildNode(int slot, int nodeIndex, in AABB bounds)
+    {
+        SetChildFlag(slot);
+        ClearChildLeafFlag(slot);
+        SetChildIndex(slot, nodeIndex);
+        SetChildBounds(slot, in bounds);
+    }
+
+    /// <summary>
+    /// Updates only the cached bounds of an already-occupied child slot, without touching its
+    /// flags or its stored index (leaf shape index or child node index). Used by
+    /// <see cref="QBVH2d.Insert{T}"/> to refit ancestor bounds on the way back up the insertion
+    /// path, where only the bounds - never what the slot points to - actually changed.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void SetChildBounds(int slot, in AABB bounds)
+    {
+        _minX = WithLane(_minX, slot, bounds.Min.X);
+        _minY = WithLane(_minY, slot, bounds.Min.Y);
+        _maxX = WithLane(_maxX, slot, bounds.Max.X);
+        _maxY = WithLane(_maxY, slot, bounds.Max.Y);
+    }
+
+    /// <summary>
+    /// Reads the cached bounds of a single child slot (see <see cref="GetChildBoundsSoA"/> for
+    /// the batched SoA form queries use). For a leaf slot this is the shape's own AABB; for a
+    /// node-pointer slot it's the joint AABB of that whole subtree.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal readonly AABB GetChildBounds(int slot) => new(
+        new Vector2(_minX.GetElement(slot), _minY.GetElement(slot)),
+        new Vector2(_maxX.GetElement(slot), _maxY.GetElement(slot)));
+
+    /// <summary>
+    /// Clears the flag marking child <paramref name="index"/> as a direct-encoded leaf, without
+    /// touching whether the slot is occupied. Used when a leaf slot is promoted to hold a
+    /// pointer to a new node instead.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ClearChildLeafFlag(int index) => Flags &= (byte)~(1 << (index + 4));
+
+    /// <summary>
+    /// Empties child slot <paramref name="slot"/>: clears its exist/leaf flags and resets its
+    /// bounds to <see cref="AABB.Empty"/>. The bounds reset isn't strictly required for
+    /// correctness (every reader masks by <see cref="Flags"/> first), but keeps a cleared slot
+    /// from holding a stale, wide AABB in case it's ever read before something else claims it.
+    /// </summary>
+    internal void ClearChild(int slot)
+    {
+        Flags &= (byte)~((1 << slot) | (1 << (slot + 4)));
+        SetChildBounds(slot, AABB.Empty);
+    }
+
+    /// <summary>
+    /// Number of currently occupied child slots (0-4).
+    /// </summary>
+    internal readonly int ChildCount() => BitOperations.PopCount((uint)(Flags & 0xF));
+
+    /// <summary>
+    /// Index (0-3) of the single occupied child slot. Only meaningful when <see cref="ChildCount"/>
+    /// is 1.
+    /// </summary>
+    internal readonly int SoleChildSlot() => BitOperations.TrailingZeroCount(Flags & 0xF);
+
+    /// <summary>
+    /// The union of every currently-occupied child slot's bounds. Used by
+    /// <see cref="QBVH2d.Remove"/>/<see cref="QBVH2d.Update"/> to recompute a node's own bounds
+    /// after a child's bounds shrink or a slot is cleared - unlike insertion, a removal or shrink
+    /// can't be handled by a simple growth union, since the result may be smaller than before.
+    /// </summary>
+    internal readonly AABB UnionOfOccupiedChildren()
+    {
+        var result = AABB.Empty;
+        int mask = Flags & 0xF;
+        while (mask != 0)
+        {
+            int bit = BitOperations.TrailingZeroCount(mask);
+            mask &= mask - 1;
+            result = AABB.Union(result, GetChildBounds(bit));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Returns a copy of <paramref name="vector"/> with lane <paramref name="lane"/> replaced by
+    /// <paramref name="value"/>, leaving the other 3 lanes untouched. Used by
+    /// <see cref="SetChildBounds"/> to update one child's bounds without disturbing its
+    /// siblings' bounds packed into the same SoA vector.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<float> WithLane(Vector128<float> vector, int lane, float value)
+    {
+        Span<float> lanes = stackalloc float[4];
+        for (int i = 0; i < 4; i++) lanes[i] = vector.GetElement(i);
+        lanes[lane] = value;
+        return Vector128.Create(lanes[0], lanes[1], lanes[2], lanes[3]);
     }
 }
