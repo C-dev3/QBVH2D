@@ -95,7 +95,7 @@ internal struct QBVH2dNode
     /// Gets references to all 4 child AABBs for optimized SIMD operations
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly unsafe void GetChildAABBRefs(out AABB aabb0, out AABB aabb1, out AABB aabb2, out AABB aabb3)
+    public readonly void GetChildAABBRefs(out AABB aabb0, out AABB aabb1, out AABB aabb2, out AABB aabb3)
     {
         aabb0 = _child0AABB;
         aabb1 = _child1AABB;

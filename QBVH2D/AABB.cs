@@ -106,7 +106,7 @@ public struct AABB
     /// <param name="aabb3">Fourth AABB</param>
     /// <returns>Bitmask indicating which AABBs contain the point (bit 0-3)</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static unsafe int Contains4(in Vector2 point, in AABB aabb0, in AABB aabb1, in AABB aabb2, in AABB aabb3)
+    internal static int Contains4(in Vector2 point, in AABB aabb0, in AABB aabb1, in AABB aabb2, in AABB aabb3)
     {
         // Use SIMD to test 4 AABBs simultaneously
         if (Sse.IsSupported)
@@ -162,7 +162,7 @@ public struct AABB
     /// <param name="aabb3">Fourth AABB</param>
     /// <returns>Bitmask indicating which AABBs intersect (bit 0-3)</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static unsafe int Intersects4(in AABB query, in AABB aabb0, in AABB aabb1, in AABB aabb2, in AABB aabb3)
+    internal static int Intersects4(in AABB query, in AABB aabb0, in AABB aabb1, in AABB aabb2, in AABB aabb3)
     {
         // Use SIMD to test 4 AABB intersections simultaneously
         if (Sse.IsSupported)
@@ -209,4 +209,153 @@ public struct AABB
     public readonly bool Intersects(in AABB other) =>
         Min.X <= other.Max.X && Max.X >= other.Min.X &&
         Min.Y <= other.Max.Y && Max.Y >= other.Min.Y;
+
+    /// <summary>
+    /// Computes the component-wise inverse of a ray direction (1/dir.X, 1/dir.Y).
+    /// Precompute this once per ray/segment and reuse it across many <see cref="IntersectsRay(in Vector2, in Vector2, float)"/>
+    /// or <see cref="IntersectsRay4"/> calls to avoid repeated division.
+    /// A zero component correctly produces +-Infinity, which the slab method handles safely.
+    /// </summary>
+    /// <param name="direction">The ray direction (does not need to be normalized)</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector2 InvDir(in Vector2 direction) => new(1f / direction.X, 1f / direction.Y);
+
+    /// <summary>
+    /// Checks if a ray/segment intersects this AABB using the slab method.
+    /// </summary>
+    /// <param name="origin">The ray's origin point</param>
+    /// <param name="invDir">
+    /// Component-wise inverse of the ray direction. Use <see cref="InvDir"/> to compute it once
+    /// per ray rather than dividing on every call.
+    /// </param>
+    /// <param name="maxT">
+    /// Maximum ray parameter to accept as a hit, e.g. pass the segment length when direction is
+    /// not normalized and you only care about intersections between origin and origin + direction.
+    /// Defaults to positive infinity for an unbounded ray.
+    /// </param>
+    /// <returns><see langword="true"/> if the ray intersects the AABB within [0, maxT]</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IntersectsRay(in Vector2 origin, in Vector2 invDir, float maxT = float.PositiveInfinity)
+    {
+        // Intersect the ray with the X slab (the region between the left and right planes)
+        float tx1 = (Min.X - origin.X) * invDir.X;
+        float tx2 = (Max.X - origin.X) * invDir.X;
+
+        float tMin = MathF.Min(tx1, tx2);
+        float tMax = MathF.Max(tx1, tx2);
+
+        // Intersect with the Y slab and narrow the running [tMin, tMax] interval
+        float ty1 = (Min.Y - origin.Y) * invDir.Y;
+        float ty2 = (Max.Y - origin.Y) * invDir.Y;
+
+        tMin = MathF.Max(tMin, MathF.Min(ty1, ty2));
+        tMax = MathF.Min(tMax, MathF.Max(ty1, ty2));
+
+        // Hit if the slabs overlap (tMax >= tMin), the overlap isn't entirely behind the
+        // origin (tMax >= 0), and it starts within the allowed range (tMin <= maxT)
+        return tMax >= tMin && tMax >= 0f && tMin <= maxT;
+    }
+
+    /// <summary>
+    /// Same as <see cref="IntersectsRay(in Vector2, in Vector2, float)"/> but also returns the
+    /// entry distance along the ray, clamped to 0 (useful when the origin starts inside the box).
+    /// </summary>
+    /// <param name="origin">The ray's origin point</param>
+    /// <param name="invDir">
+    /// Component-wise inverse of the ray direction. Use <see cref="InvDir"/> to compute it once
+    /// per ray rather than dividing on every call.
+    /// </param>
+    /// <param name="maxT">
+    /// Maximum ray parameter to accept as a hit, e.g. pass the segment length when direction is
+    /// not normalized and you only care about intersections between origin and origin + direction.
+    /// </param>
+    /// <param name="tHit">The ray parameter at the entry point when this returns true; otherwise undefined</param>
+    /// <returns><see langword="true"/> if the ray intersects the AABB within [0, maxT]</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IntersectsRay(in Vector2 origin, in Vector2 invDir, float maxT, out float tHit)
+    {
+        float tx1 = (Min.X - origin.X) * invDir.X;
+        float tx2 = (Max.X - origin.X) * invDir.X;
+
+        float tMin = MathF.Min(tx1, tx2);
+        float tMax = MathF.Max(tx1, tx2);
+
+        float ty1 = (Min.Y - origin.Y) * invDir.Y;
+        float ty2 = (Max.Y - origin.Y) * invDir.Y;
+
+        tMin = MathF.Max(tMin, MathF.Min(ty1, ty2));
+        tMax = MathF.Min(tMax, MathF.Max(ty1, ty2));
+
+        bool hit = tMax >= tMin && tMax >= 0f && tMin <= maxT;
+        tHit = hit ? MathF.Max(tMin, 0f) : 0f;
+        return hit;
+    }
+
+    /// <summary>
+    /// Checks if a ray/segment intersects any of 4 AABBs using SIMD operations (slab method).
+    /// Returns a bitmask where bit i is set if the ray intersects AABB i within [0, maxT].
+    /// </summary>
+    /// <param name="origin">The ray's origin point</param>
+    /// <param name="invDir">Component-wise inverse of the ray direction, see <see cref="InvDir"/></param>
+    /// <param name="maxT">Maximum ray parameter to accept as a hit (e.g. segment length)</param>
+    /// <param name="aabb0">First AABB</param>
+    /// <param name="aabb1">Second AABB</param>
+    /// <param name="aabb2">Third AABB</param>
+    /// <param name="aabb3">Fourth AABB</param>
+    /// <returns>Bitmask indicating which AABBs the ray intersects (bit 0-3)</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe int IntersectsRay4(in Vector2 origin, in Vector2 invDir, float maxT,
+        in AABB aabb0, in AABB aabb1, in AABB aabb2, in AABB aabb3)
+    {
+        if (Sse.IsSupported)
+        {
+            // Broadcast the ray (same origin/direction tested against all 4 boxes)
+            var ox = Vector128.Create(origin.X);
+            var oy = Vector128.Create(origin.Y);
+            var invDx = Vector128.Create(invDir.X);
+            var invDy = Vector128.Create(invDir.Y);
+
+            var minX = Vector128.Create(aabb0.Min.X, aabb1.Min.X, aabb2.Min.X, aabb3.Min.X);
+            var minY = Vector128.Create(aabb0.Min.Y, aabb1.Min.Y, aabb2.Min.Y, aabb3.Min.Y);
+            var maxX = Vector128.Create(aabb0.Max.X, aabb1.Max.X, aabb2.Max.X, aabb3.Max.X);
+            var maxY = Vector128.Create(aabb0.Max.Y, aabb1.Max.Y, aabb2.Max.Y, aabb3.Max.Y);
+
+            // X slab
+            var tx1 = Sse.Multiply(Sse.Subtract(minX, ox), invDx);
+            var tx2 = Sse.Multiply(Sse.Subtract(maxX, ox), invDx);
+            var tMinX = Sse.Min(tx1, tx2);
+            var tMaxX = Sse.Max(tx1, tx2);
+
+            // Y slab
+            var ty1 = Sse.Multiply(Sse.Subtract(minY, oy), invDy);
+            var ty2 = Sse.Multiply(Sse.Subtract(maxY, oy), invDy);
+            var tMinY = Sse.Min(ty1, ty2);
+            var tMaxY = Sse.Max(ty1, ty2);
+
+            // Narrow the running interval across both slabs
+            var tMin = Sse.Max(tMinX, tMinY);
+            var tMax = Sse.Min(tMaxX, tMaxY);
+
+            var zero = Vector128<float>.Zero;
+            var maxTVec = Vector128.Create(maxT);
+
+            var overlap = Sse.CompareGreaterThanOrEqual(tMax, tMin);
+            var inFront = Sse.CompareGreaterThanOrEqual(tMax, zero);
+            var withinRange = Sse.CompareLessThanOrEqual(tMin, maxTVec);
+
+            var result = Sse.And(Sse.And(overlap, inFront), withinRange);
+
+            return Sse.MoveMask(result);
+        }
+        else
+        {
+            // Fallback: scalar version
+            int mask = 0;
+            if (aabb0.IntersectsRay(in origin, in invDir, maxT)) mask |= 1;
+            if (aabb1.IntersectsRay(in origin, in invDir, maxT)) mask |= 2;
+            if (aabb2.IntersectsRay(in origin, in invDir, maxT)) mask |= 4;
+            if (aabb3.IntersectsRay(in origin, in invDir, maxT)) mask |= 8;
+            return mask;
+        }
+    }
 }

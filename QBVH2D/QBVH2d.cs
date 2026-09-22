@@ -178,4 +178,131 @@ public class QBVH2d
             QueryAABBRecursive(node.GetChildIndex(3), queryAABB, results);
         }
     }
+
+    /// <summary>
+    /// Creates an iterator that traverses shapes whose AABB intersects the given ray or segment
+    /// </summary>
+    /// <param name="origin">The ray's origin point</param>
+    /// <param name="direction">The ray's direction (does not need to be normalized)</param>
+    /// <param name="maxT">
+    /// Maximum ray parameter to accept as a hit. When <paramref name="direction"/> is the raw
+    /// displacement from <paramref name="origin"/> to a target point, pass 1.0 to restrict the
+    /// query to that exact segment. Defaults to positive infinity for an unbounded ray.
+    /// </param>
+    /// <returns>An iterator over shape indices whose AABB the ray/segment intersects</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public QBVH2DRayIterator RayIterator(Vector2 origin, Vector2 direction, float maxT = float.PositiveInfinity) =>
+        new(this, origin, direction, maxT);
+
+    /// <summary>
+    /// Gets all shape indices whose AABB intersects the given ray or segment
+    /// </summary>
+    /// <param name="origin">The ray's origin point</param>
+    /// <param name="direction">The ray's direction (does not need to be normalized)</param>
+    /// <param name="maxT">Maximum ray parameter to accept as a hit (see <see cref="RayIterator"/>)</param>
+    /// <returns>List of shape indices</returns>
+    public List<int> QueryRay(Vector2 origin, Vector2 direction, float maxT = float.PositiveInfinity)
+    {
+        List<int> results = new(16);
+
+        using var iterator = RayIterator(origin, direction, maxT);
+        foreach (var index in iterator)
+        {
+            results.Add(index);
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Gets all shape indices whose AABB intersects the given ray or segment
+    /// </summary>
+    /// <param name="origin">The ray's origin point</param>
+    /// <param name="direction">The ray's direction (does not need to be normalized)</param>
+    /// <param name="maxT">Maximum ray parameter to accept as a hit (see <see cref="RayIterator"/>)</param>
+    /// <param name="results">Span to write results to</param>
+    /// <returns>Number of results written</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int QueryRay(Vector2 origin, Vector2 direction, float maxT, Span<int> results)
+    {
+        int count = 0;
+
+        using var iterator = RayIterator(origin, direction, maxT);
+        foreach (var index in iterator)
+        {
+            if (count < results.Length)
+            {
+                results[count++] = index;
+            }
+            else
+            {
+                break;
+            }
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Gets all shape indices whose AABB intersects the given ray or segment
+    /// </summary>
+    /// <param name="origin">The ray's origin point</param>
+    /// <param name="direction">The ray's direction (does not need to be normalized)</param>
+    /// <param name="maxT">Maximum ray parameter to accept as a hit (see <see cref="RayIterator"/>)</param>
+    /// <param name="results">List to add results to (not cleared)</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void QueryRay(Vector2 origin, Vector2 direction, float maxT, ref List<int> results)
+    {
+        using var iterator = RayIterator(origin, direction, maxT);
+        foreach (var index in iterator)
+        {
+            results.Add(index);
+        }
+    }
+
+    /// <summary>
+    /// Checks whether any shape's AABB intersects the segment from <paramref name="from"/> to
+    /// <paramref name="to"/>, stopping at the first hit without allocating. Intended for
+    /// line-of-sight checks (e.g. Theta* pathfinding) against a QBVH built from obstacle shapes:
+    /// a <see langword="false"/> result means the straight line between the two points is clear
+    /// of every registered obstacle's AABB.
+    /// </summary>
+    /// <param name="from">The segment's start point</param>
+    /// <param name="to">The segment's end point</param>
+    /// <returns><see langword="true"/> if at least one shape's AABB blocks the segment</returns>
+    public bool RaycastAny(Vector2 from, Vector2 to)
+    {
+        if (NodeCount == 0) return false;
+
+        var direction = to - from;
+        var invDir = AABB.InvDir(direction);
+
+        // maxT = 1.0 because direction is the raw (unnormalized) displacement from
+        // "from" to "to", so t=1 corresponds exactly to the "to" endpoint
+        return RaycastAnyRecursive(0, from, invDir, 1.0f);
+    }
+
+    private bool RaycastAnyRecursive(int nodeIndex, Vector2 origin, Vector2 invDir, float maxT)
+    {
+        if (nodeIndex >= NodeCount) return false;
+
+        ref var node = ref Nodes[nodeIndex];
+
+        if (node.IsLeaf)
+        {
+            return true;
+        }
+
+        node.GetChildAABBRefs(out var aabb0, out var aabb1, out var aabb2, out var aabb3);
+        int hitMask = AABB.IntersectsRay4(in origin, in invDir, maxT, in aabb0, in aabb1, in aabb2, in aabb3);
+
+        if ((hitMask & 1) != 0 && node.HasChild(0) && RaycastAnyRecursive(node.GetChildIndex(0), origin, invDir, maxT))
+            return true;
+        if ((hitMask & 2) != 0 && node.HasChild(1) && RaycastAnyRecursive(node.GetChildIndex(1), origin, invDir, maxT))
+            return true;
+        if ((hitMask & 4) != 0 && node.HasChild(2) && RaycastAnyRecursive(node.GetChildIndex(2), origin, invDir, maxT))
+            return true;
+        if ((hitMask & 8) != 0 && node.HasChild(3) && RaycastAnyRecursive(node.GetChildIndex(3), origin, invDir, maxT))
+            return true;
+
+        return false;
+    }
 }
