@@ -1,19 +1,23 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace QBVH2D;
 
 /// <summary>
-/// QBVH2D node - can be either a leaf or an internal node with up to 4 children
+/// QBVH2D node - an internal node with up to 4 children. Each child slot holds either the index
+/// of another <see cref="QBVH2dNode"/>, or - when <see cref="IsChildLeaf"/> is set for that slot -
+/// a shape index directly (a "direct-encoded" leaf). Direct-encoded leaves don't consume a node
+/// of their own, so a group of up to <see cref="MaxLeafSize"/> shapes fits in a single node with
+/// no children nodes at all.
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
 internal struct QBVH2dNode
 {
-    // Leaf properties
-    public int ShapeIndex { get; set; }
-
-    // Bit flags: bits 0-3 indicate which children exist, bit 4 indicates if this is a leaf
+    // Bit flags: bits 0-3 indicate which of the 4 child slots are occupied, bits 4-7 indicate
+    // (for each occupied slot) whether it's a direct-encoded leaf - in which case the
+    // corresponding child index field holds a shape index - rather than another node's index.
     public byte Flags { get; set; }
 
     // Padding for alignment
@@ -21,22 +25,17 @@ internal struct QBVH2dNode
     private readonly byte _padding2;
     private readonly byte _padding3;
 
-    private unsafe fixed int _childIndices[4];
+    private int _childIndex0;
+    private int _childIndex1;
+    private int _childIndex2;
+    private int _childIndex3;
 
-    private AABB _child0AABB;
-    private AABB _child1AABB;
-    private AABB _child2AABB;
-    private AABB _child3AABB;
-
-    /// <summary>
-    /// Gets or sets whether this node is a leaf node
-    /// </summary>
-    public bool IsLeaf
-    {
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        readonly get => (Flags & 0x10) != 0;
-        set => Flags = value ? (byte)(Flags | 0x10) : (byte)(Flags & ~0x10);
-    }
+    // Child bounds stored SoA: one lane per child, 4-wide, so a query loads these vectors
+    // directly instead of gathering/transposing 4 separate AABB structs at query time.
+    private Vector128<float> _minX;
+    private Vector128<float> _minY;
+    private Vector128<float> _maxX;
+    private Vector128<float> _maxY;
 
     /// <summary>
     /// Checks if a child at the specified index exists
@@ -45,137 +44,176 @@ internal struct QBVH2dNode
     public readonly bool HasChild(int index) => (Flags & (1 << index)) != 0;
 
     /// <summary>
+    /// Checks whether the child at the specified slot is a direct-encoded leaf (its
+    /// <see cref="GetChildIndex"/> value is a shape index) rather than another node's index.
+    /// Only meaningful when <see cref="HasChild"/> is <see langword="true"/> for that slot.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly bool IsChildLeaf(int index) => (Flags & (1 << (index + 4))) != 0;
+
+    /// <summary>
     /// Sets the flag indicating a child exists at the specified index
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void SetChildFlag(int index) => Flags |= (byte)(1 << index);
 
     /// <summary>
-    /// Gets the node index of the child at the specified index
+    /// Sets the flag indicating the child at the specified index is a direct-encoded leaf
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly unsafe int GetChildIndex(int index)
-    {
-        if (index < 0 || index > 3) return -1;
-        fixed (int* ptr = _childIndices)
-        {
-            return ptr[index];
-        }
-    }
+    private void SetChildLeafFlag(int index) => Flags |= (byte)(1 << (index + 4));
 
     /// <summary>
-    /// Sets the node index of the child at the specified index
+    /// Gets the value stored for the child at the specified slot: a node index when
+    /// <see cref="IsChildLeaf"/> is <see langword="false"/>, or a shape index when it's
+    /// <see langword="true"/>. Check <see cref="HasChild"/> first.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private unsafe void SetChildIndex(int index, int value)
+    public readonly int GetChildIndex(int index) => index switch
     {
-        if (index < 0 || index > 3) return;
-        fixed (int* ptr = _childIndices)
-        {
-            ptr[index] = value;
-        }
-    }
-
-    /// <summary>
-    /// Sets the AABB of the child at the specified index
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void SetChildAABB(int index, in AABB aabb)
-    {
-        switch (index)
-        {
-            case 0: _child0AABB = aabb; break;
-            case 1: _child1AABB = aabb; break;
-            case 2: _child2AABB = aabb; break;
-            case 3: _child3AABB = aabb; break;
-        }
-    }
-
-    /// <summary>
-    /// Gets references to all 4 child AABBs for optimized SIMD operations
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly void GetChildAABBRefs(out AABB aabb0, out AABB aabb1, out AABB aabb2, out AABB aabb3)
-    {
-        aabb0 = _child0AABB;
-        aabb1 = _child1AABB;
-        aabb2 = _child2AABB;
-        aabb3 = _child3AABB;
-    }
-
-    private const float Epsilon = 0.00001f;
-    private const int MaxLeafSize = 4; // Maximum shapes in a leaf before splitting
-
-    /// <summary>
-    /// Creates a leaf node
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static QBVH2dNode CreateLeaf(int shapeIndex) => new()
-    {
-        IsLeaf = true,
-        ShapeIndex = shapeIndex
+        0 => _childIndex0,
+        1 => _childIndex1,
+        2 => _childIndex2,
+        3 => _childIndex3,
+        _ => -1
     };
 
     /// <summary>
-    /// Creates an internal node with up to 4 children
+    /// Sets the raw value (node index or shape index) of the child at the specified index
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void SetChildIndex(int index, int value)
+    {
+        switch (index)
+        {
+            case 0: _childIndex0 = value; break;
+            case 1: _childIndex1 = value; break;
+            case 2: _childIndex2 = value; break;
+            case 3: _childIndex3 = value; break;
+        }
+    }
+
+    /// <summary>
+    /// Packs the 4 children's bounds into the SoA layout (one lane per child)
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void SetChildBoundsSoA(in AABB c0, in AABB c1, in AABB c2, in AABB c3)
+    {
+        _minX = Vector128.Create(c0.Min.X, c1.Min.X, c2.Min.X, c3.Min.X);
+        _minY = Vector128.Create(c0.Min.Y, c1.Min.Y, c2.Min.Y, c3.Min.Y);
+        _maxX = Vector128.Create(c0.Max.X, c1.Max.X, c2.Max.X, c3.Max.X);
+        _maxY = Vector128.Create(c0.Max.Y, c1.Max.Y, c2.Max.Y, c3.Max.Y);
+    }
+
+    /// <summary>
+    /// Gets the 4 children's bounds already in SoA form (one lane per child), ready to pass
+    /// straight into the <see cref="AABB"/> SIMD query helpers with no further transposing.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly void GetChildBoundsSoA(out Vector128<float> minX, out Vector128<float> minY, out Vector128<float> maxX, out Vector128<float> maxY)
+    {
+        minX = _minX;
+        minY = _minY;
+        maxX = _maxX;
+        maxY = _maxY;
+    }
+
+    private const float Epsilon = 0.00001f;
+    private const int MaxLeafSize = 4; // Maximum shapes in a leaf group before splitting further
+
+    /// <summary>
+    /// Sentinel returned/passed for an empty child slot. Distinguishable from every real
+    /// encoded value: a node index is always &gt;= 0, and a leaf encoding (~shapeIndex) never
+    /// reaches <see cref="int.MinValue"/> for any realistic shape count.
+    /// </summary>
+    private const int NoChild = int.MinValue;
+
+    /// <summary>
+    /// Writes one child slot from an encoded value produced by <see cref="Build"/>:
+    /// non-negative means an internal node index, negative (other than <see cref="NoChild"/>)
+    /// means a direct-encoded leaf whose shape index is <c>~encoded</c>. <see cref="NoChild"/>
+    /// leaves the slot's exist/leaf flags unset.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void SetChild(int slot, int encoded)
+    {
+        if (encoded == NoChild) return;
+
+        SetChildFlag(slot);
+
+        if (encoded < 0)
+        {
+            SetChildLeafFlag(slot);
+            SetChildIndex(slot, ~encoded);
+        }
+        else
+        {
+            SetChildIndex(slot, encoded);
+        }
+    }
+
+    /// <summary>
+    /// Creates an internal node with up to 4 children. Each child parameter is an encoded value
+    /// as returned by <see cref="Build"/>: <see cref="NoChild"/> for an empty slot, a
+    /// non-negative node index, or a negative direct-encoded leaf (<c>~shapeIndex</c>).
     /// </summary>
     public static QBVH2dNode CreateNode(
-        int child0Idx, AABB child0AABB,
-        int child1Idx, AABB child1AABB,
-        int child2Idx, AABB child2AABB,
-        int child3Idx, AABB child3AABB)
+        int child0, AABB child0AABB,
+        int child1, AABB child1AABB,
+        int child2, AABB child2AABB,
+        int child3, AABB child3AABB)
     {
-        var node = new QBVH2dNode
-        {
-            IsLeaf = false
-        };
+        var node = new QBVH2dNode();
 
-        // Batch set child indices and AABBs using contiguous memory
-        node.SetChildIndex(0, child0Idx);
-        node.SetChildAABB(0, child0AABB);
+        node.SetChild(0, child0);
+        node.SetChild(1, child1);
+        node.SetChild(2, child2);
+        node.SetChild(3, child3);
 
-        node.SetChildIndex(1, child1Idx);
-        node.SetChildAABB(1, child1AABB);
-
-        node.SetChildIndex(2, child2Idx);
-        node.SetChildAABB(2, child2AABB);
-
-        node.SetChildIndex(3, child3Idx);
-        node.SetChildAABB(3, child3AABB);
-
-        // Set flags for which children exist
-        if (child0Idx >= 0) node.SetChildFlag(0);
-        if (child1Idx >= 0) node.SetChildFlag(1);
-        if (child2Idx >= 0) node.SetChildFlag(2);
-        if (child3Idx >= 0) node.SetChildFlag(3);
+        node.SetChildBoundsSoA(in child0AABB, in child1AABB, in child2AABB, in child3AABB);
 
         return node;
     }
 
     /// <summary>
-    /// Builds a QBVH tree recursively using spatial subdivision
+    /// Ensures the node array can hold at least <paramref name="requiredCount"/> nodes,
+    /// doubling its size (or growing to <paramref name="requiredCount"/>, whichever is
+    /// larger) when it's too small. No-op when the array already has enough room.
     /// </summary>
-    public static int Build<T>(T[] shapes, ReadOnlySpan<int> indices, QBVH2dNode[] nodes, ref int nodeCount)
-        where T : IBounded
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void EnsureCapacity(ref QBVH2dNode[] nodes, int requiredCount)
     {
-        // Create leaf for small groups
-        if (indices.Length <= MaxLeafSize)
+        if (requiredCount <= nodes.Length) return;
+
+        int newSize = nodes.Length == 0 ? 4 : nodes.Length * 2;
+        if (newSize < requiredCount) newSize = requiredCount;
+        Array.Resize(ref nodes, newSize);
+    }
+
+    /// <summary>
+    /// Builds a QBVH (sub)tree recursively using spatial subdivision.
+    /// </summary>
+    /// <returns>
+    /// An encoded value identifying the root of what was just built: a non-negative
+    /// <c>nodes</c> index for an internal node, or a negative direct-encoded leaf
+    /// (<c>~shapeIndex</c>) when <paramref name="indices"/> held a single shape and no node
+    /// needed to be created at all. Callers that store this value in a parent's child slot can
+    /// pass it straight to <see cref="CreateNode"/> unchanged.
+    /// </returns>
+    public static int Build<T>(T[] shapes, ReadOnlySpan<int> indices, ref QBVH2dNode[] nodes, ref int nodeCount)
+    where T : IBounded
+    {
+        if (indices.Length == 1)
         {
-            if (indices.Length == 1)
-            {
-                int shapeIndex = indices[0];
-                int leafNodeIndex = nodeCount++;
-                nodes[leafNodeIndex] = CreateLeaf(shapeIndex);
-                return leafNodeIndex;
-            }
-            else
-            {
-                // Create multiple leaf nodes for remaining shapes
-                return BuildMultipleLeaves(shapes, indices, nodes, ref nodeCount);
-            }
+            // Single shape: encode it directly, no node consumed.
+            return ~indices[0];
         }
 
-        // Compute bounds
+        if (indices.Length <= MaxLeafSize)
+        {
+            return BuildLeafGroup(shapes, indices, ref nodes, ref nodeCount);
+        }
+
         var aabbBounds = AABB.Empty;
         var centroidBounds = AABB.Empty;
 
@@ -187,21 +225,18 @@ internal struct QBVH2dNode
             centroidBounds.GrowMut(in center);
         }
 
-        // Reserve node index
+        // Reserve node index (may grow the array)
+        EnsureCapacity(ref nodes, nodeCount + 1);
         int nodeIndex = nodeCount++;
 
-        // Split into 4 quadrants based on center
         var center2d = centroidBounds.Center;
         var size = centroidBounds.Size;
 
-        // Check if we can actually split
         if (size.X < Epsilon && size.Y < Epsilon)
         {
-            // All shapes at same location, split evenly
-            return BuildBySplitting(shapes, indices, nodes, ref nodeCount, nodeIndex);
+            return BuildBySplitting(shapes, indices, ref nodes, ref nodeCount, nodeIndex);
         }
 
-        // Allocate buckets for 4 quadrants
         var bucket0 = ArrayPool<int>.Shared.Rent(indices.Length);
         var bucket1 = ArrayPool<int>.Shared.Rent(indices.Length);
         var bucket2 = ArrayPool<int>.Shared.Rent(indices.Length);
@@ -211,7 +246,6 @@ internal struct QBVH2dNode
 
         try
         {
-            // Distribute shapes into quadrants
             foreach (int idx in indices)
             {
                 var shapeCenter = shapes[idx].GetAABB().Center;
@@ -220,50 +254,50 @@ internal struct QBVH2dNode
                 bool isTop = shapeCenter.Y >= center2d.Y;
 
                 if (!isRight && !isTop)
-                    bucket0[count0++] = idx; // Bottom-left
+                    bucket0[count0++] = idx;
                 else if (isRight && !isTop)
-                    bucket1[count1++] = idx; // Bottom-right
+                    bucket1[count1++] = idx;
                 else if (!isRight && isTop)
-                    bucket2[count2++] = idx; // Top-left
+                    bucket2[count2++] = idx;
                 else
-                    bucket3[count3++] = idx; // Top-right
+                    bucket3[count3++] = idx;
             }
 
-            // Build children
-            int child0Idx = -1, child1Idx = -1, child2Idx = -1, child3Idx = -1;
+            int child0 = NoChild, child1 = NoChild, child2 = NoChild, child3 = NoChild;
             AABB child0AABB = AABB.Empty, child1AABB = AABB.Empty;
             AABB child2AABB = AABB.Empty, child3AABB = AABB.Empty;
 
             if (count0 > 0)
             {
                 child0AABB = Utils.JointAABBOfShapes(bucket0.AsSpan(0, count0), shapes);
-                child0Idx = Build(shapes, bucket0.AsSpan(0, count0), nodes, ref nodeCount);
+                child0 = Build(shapes, bucket0.AsSpan(0, count0), ref nodes, ref nodeCount);
             }
 
             if (count1 > 0)
             {
                 child1AABB = Utils.JointAABBOfShapes(bucket1.AsSpan(0, count1), shapes);
-                child1Idx = Build(shapes, bucket1.AsSpan(0, count1), nodes, ref nodeCount);
+                child1 = Build(shapes, bucket1.AsSpan(0, count1), ref nodes, ref nodeCount);
             }
 
             if (count2 > 0)
             {
                 child2AABB = Utils.JointAABBOfShapes(bucket2.AsSpan(0, count2), shapes);
-                child2Idx = Build(shapes, bucket2.AsSpan(0, count2), nodes, ref nodeCount);
+                child2 = Build(shapes, bucket2.AsSpan(0, count2), ref nodes, ref nodeCount);
             }
 
             if (count3 > 0)
             {
                 child3AABB = Utils.JointAABBOfShapes(bucket3.AsSpan(0, count3), shapes);
-                child3Idx = Build(shapes, bucket3.AsSpan(0, count3), nodes, ref nodeCount);
+                child3 = Build(shapes, bucket3.AsSpan(0, count3), ref nodes, ref nodeCount);
             }
 
-            // OPTIMIZATION: Node creation now uses contiguous memory layout
+            // nodes may have been reallocated by any of the recursive calls above;
+            // `nodes` here always refers to the current array because it's a ref parameter.
             nodes[nodeIndex] = CreateNode(
-                child0Idx, child0AABB,
-                child1Idx, child1AABB,
-                child2Idx, child2AABB,
-                child3Idx, child3AABB
+                child0, child0AABB,
+                child1, child1AABB,
+                child2, child2AABB,
+                child3, child3AABB
             );
 
             return nodeIndex;
@@ -278,10 +312,11 @@ internal struct QBVH2dNode
     }
 
     /// <summary>
-    /// Builds nodes by simply splitting indices into 4 groups
+    /// Builds nodes by simply splitting indices into 4 groups (used when the centroids all
+    /// coincide, so spatial bucketing can't separate them)
     /// </summary>
     private static int BuildBySplitting<T>(T[] shapes, ReadOnlySpan<int> indices,
-        QBVH2dNode[] nodes, ref int nodeCount, int nodeIndex) where T : IBounded
+    ref QBVH2dNode[] nodes, ref int nodeCount, int nodeIndex) where T : IBounded
     {
         int quarterSize = indices.Length / 4;
         int remainder = indices.Length % 4;
@@ -293,7 +328,7 @@ internal struct QBVH2dNode
         sizes[3] = quarterSize;
 
         int offset = 0;
-        int child0Idx = -1, child1Idx = -1, child2Idx = -1, child3Idx = -1;
+        int child0 = NoChild, child1 = NoChild, child2 = NoChild, child3 = NoChild;
         AABB child0AABB = AABB.Empty, child1AABB = AABB.Empty;
         AABB child2AABB = AABB.Empty, child3AABB = AABB.Empty;
 
@@ -301,7 +336,7 @@ internal struct QBVH2dNode
         {
             var span = indices.Slice(offset, sizes[0]);
             child0AABB = Utils.JointAABBOfShapes(span, shapes);
-            child0Idx = Build(shapes, span, nodes, ref nodeCount);
+            child0 = Build(shapes, span, ref nodes, ref nodeCount);
             offset += sizes[0];
         }
 
@@ -309,7 +344,7 @@ internal struct QBVH2dNode
         {
             var span = indices.Slice(offset, sizes[1]);
             child1AABB = Utils.JointAABBOfShapes(span, shapes);
-            child1Idx = Build(shapes, span, nodes, ref nodeCount);
+            child1 = Build(shapes, span, ref nodes, ref nodeCount);
             offset += sizes[1];
         }
 
@@ -317,7 +352,7 @@ internal struct QBVH2dNode
         {
             var span = indices.Slice(offset, sizes[2]);
             child2AABB = Utils.JointAABBOfShapes(span, shapes);
-            child2Idx = Build(shapes, span, nodes, ref nodeCount);
+            child2 = Build(shapes, span, ref nodes, ref nodeCount);
             offset += sizes[2];
         }
 
@@ -325,64 +360,53 @@ internal struct QBVH2dNode
         {
             var span = indices.Slice(offset, sizes[3]);
             child3AABB = Utils.JointAABBOfShapes(span, shapes);
-            child3Idx = Build(shapes, span, nodes, ref nodeCount);
+            child3 = Build(shapes, span, ref nodes, ref nodeCount);
         }
 
         nodes[nodeIndex] = CreateNode(
-            child0Idx, child0AABB,
-            child1Idx, child1AABB,
-            child2Idx, child2AABB,
-            child3Idx, child3AABB
+            child0, child0AABB,
+            child1, child1AABB,
+            child2, child2AABB,
+            child3, child3AABB
         );
 
         return nodeIndex;
     }
 
     /// <summary>
-    /// Creates multiple leaf nodes for a small group of shapes
+    /// Builds a single node holding up to <see cref="MaxLeafSize"/> shapes as direct-encoded
+    /// leaves in its child slots - no child nodes are created at all.
     /// </summary>
-    private static int BuildMultipleLeaves<T>(T[] shapes, ReadOnlySpan<int> indices,
-        QBVH2dNode[] nodes, ref int nodeCount) where T : IBounded
+    private static int BuildLeafGroup<T>(T[] shapes, ReadOnlySpan<int> indices,
+    ref QBVH2dNode[] nodes, ref int nodeCount) where T : IBounded
     {
+        EnsureCapacity(ref nodes, nodeCount + 1);
         int nodeIndex = nodeCount++;
 
-        int child0Idx = -1, child1Idx = -1, child2Idx = -1, child3Idx = -1;
+        int child0 = NoChild, child1 = NoChild, child2 = NoChild, child3 = NoChild;
         AABB child0AABB = AABB.Empty, child1AABB = AABB.Empty;
         AABB child2AABB = AABB.Empty, child3AABB = AABB.Empty;
 
-        for (int i = 0; i < indices.Length && i < 4; i++)
+        for (int i = 0; i < indices.Length && i < MaxLeafSize; i++)
         {
-            var idx = indices[i];
+            int idx = indices[i];
             var aabb = shapes[idx].GetAABB();
-            int leafIdx = nodeCount++;
-            nodes[leafIdx] = CreateLeaf(idx);
+            int encoded = ~idx; // direct-encoded leaf
 
             switch (i)
             {
-                case 0:
-                    child0Idx = leafIdx;
-                    child0AABB = aabb;
-                    break;
-                case 1:
-                    child1Idx = leafIdx;
-                    child1AABB = aabb;
-                    break;
-                case 2:
-                    child2Idx = leafIdx;
-                    child2AABB = aabb;
-                    break;
-                case 3:
-                    child3Idx = leafIdx;
-                    child3AABB = aabb;
-                    break;
+                case 0: child0 = encoded; child0AABB = aabb; break;
+                case 1: child1 = encoded; child1AABB = aabb; break;
+                case 2: child2 = encoded; child2AABB = aabb; break;
+                case 3: child3 = encoded; child3AABB = aabb; break;
             }
         }
 
         nodes[nodeIndex] = CreateNode(
-            child0Idx, child0AABB,
-            child1Idx, child1AABB,
-            child2Idx, child2AABB,
-            child3Idx, child3AABB
+            child0, child0AABB,
+            child1, child1AABB,
+            child2, child2AABB,
+            child3, child3AABB
         );
 
         return nodeIndex;

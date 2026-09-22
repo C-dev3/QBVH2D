@@ -1,4 +1,5 @@
 ﻿using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 
 namespace QBVH2D;
 
@@ -26,45 +27,39 @@ public readonly struct QBVHNodeView
     }
 
     /// <summary>
-    /// Whether this node is a leaf (holds a single shape) rather than an internal node with children.
-    /// </summary>
-    public bool IsLeaf
-    {
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _node.IsLeaf;
-    }
-
-    /// <summary>
-    /// The shape index this node refers to. Only meaningful when <see cref="IsLeaf"/> is <see langword="true"/>.
-    /// </summary>
-    public int ShapeIndex
-    {
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _node.ShapeIndex;
-    }
-
-    /// <summary>
-    /// Checks if a child exists at the given slot. Only meaningful when <see cref="IsLeaf"/> is
-    /// <see langword="false"/>.
+    /// Checks if a child exists at the given slot.
     /// </summary>
     /// <param name="slot">Child slot index, 0-3</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool HasChild(int slot) => _node.HasChild(slot);
 
     /// <summary>
-    /// Gets the node index of the child at the given slot, for use with <see cref="QBVH2d.GetNode(int)"/>
-    /// to descend into it. Check <see cref="HasChild"/> first; a slot with no child returns a negative index.
+    /// Checks whether the child at the given slot is a direct-encoded leaf - i.e.
+    /// <see cref="GetChildIndex"/> for that slot returns a shape index rather than another
+    /// node's index. Only meaningful when <see cref="HasChild"/> is <see langword="true"/> for
+    /// that slot; a leaf shape doesn't have its own node to descend into.
+    /// </summary>
+    /// <param name="slot">Child slot index, 0-3</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool IsChildLeaf(int slot) => _node.IsChildLeaf(slot);
+
+    /// <summary>
+    /// Gets the value stored for the child at the given slot: a node index (for use with
+    /// <see cref="QBVH2d.GetNode(int)"/> to descend into it) when <see cref="IsChildLeaf"/> is
+    /// <see langword="false"/>, or a shape index directly when it's <see langword="true"/>.
+    /// Check <see cref="HasChild"/> first; a slot with no child returns an unspecified value.
     /// </summary>
     /// <param name="slot">Child slot index, 0-3</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int GetChildIndex(int slot) => _node.GetChildIndex(slot);
 
     /// <summary>
-    /// Gets the bounding boxes of all 4 child slots at once, matching the layout used internally
-    /// for SIMD queries. A slot without a child (see <see cref="HasChild"/>) has an unspecified
-    /// AABB and should be ignored.
+    /// Gets the bounding boxes of all 4 child slots at once, in SoA form (one lane per child)
+    /// matching the layout used internally for SIMD queries: lane <c>i</c> across the four
+    /// vectors is the AABB of child slot <c>i</c>. A slot without a child (see
+    /// <see cref="HasChild"/>) has an unspecified AABB and should be ignored.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void GetChildAABBs(out AABB aabb0, out AABB aabb1, out AABB aabb2, out AABB aabb3) =>
-        _node.GetChildAABBRefs(out aabb0, out aabb1, out aabb2, out aabb3);
+    public void GetChildBoundsSoA(out Vector128<float> minX, out Vector128<float> minY, out Vector128<float> maxX, out Vector128<float> maxY) =>
+        _node.GetChildBoundsSoA(out minX, out minY, out maxX, out maxY);
 }

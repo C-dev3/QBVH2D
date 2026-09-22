@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 
@@ -9,12 +10,21 @@ namespace QBVH2D;
 /// </summary>
 public class QBVH2d
 {
-    internal QBVH2dNode[] Nodes { get; set; }
+    internal QBVH2dNode[] Nodes { get; set; } = Array.Empty<QBVH2dNode>();
 
     /// <summary>
     /// Number of nodes currently in the tree. Valid node indices are in range [0, NodeCount).
+    /// Always 0 when <see cref="RootLeafShapeIndex"/> is set, since a single-shape tree doesn't
+    /// need a node at all.
     /// </summary>
     public int NodeCount { get; internal set; }
+
+    /// <summary>
+    /// When the whole tree is a single shape, its index - direct-encoded here instead of in a
+    /// node, since a lone shape has no siblings to branch against. -1 for every other tree
+    /// (including an empty one), in which case <see cref="RootIndex"/> is the real root.
+    /// </summary>
+    internal int RootLeafShapeIndex { get; set; } = -1;
 
     /// <summary>
     /// 
@@ -43,32 +53,48 @@ public class QBVH2d
         if (shapes.Length == 0)
             return new QBVH2d();
 
-        // QBVH uses 4-way branching, so calculate max nodes needed
-        // Upper bound: each level reduces by factor of 4
-        int maxDepth = (int)Math.Ceiling(Math.Log(shapes.Length, 4)) + 1;
-        int expectedNodeCount = (int)((Math.Pow(4, maxDepth) - 1) / 3) + shapes.Length;
-        var nodes = new QBVH2dNode[expectedNodeCount];
+        // Start small and let QBVH2dNode.Build grow the array on demand instead of
+        // pre-allocating the theoretical worst case (a perfectly balanced quad-tree).
+        // MaxLeafSize == 4 means internal-node count is typically well under the shape
+        // count, so this is already a generous starting point for the common case.
+        int initialCapacity = Math.Max(4, shapes.Length + shapes.Length / 2);
+        var nodes = new QBVH2dNode[initialCapacity];
         int nodeCount = 0;
 
+        int rootEncoded;
         if (shapes.Length <= 1024)
         {
-            // Use stackalloc for indices buffer
             Span<int> indices = stackalloc int[shapes.Length];
             for (int i = 0; i < shapes.Length; i++)
                 indices[i] = i;
 
-            QBVH2dNode.Build(shapes, indices, nodes, ref nodeCount);
+            rootEncoded = QBVH2dNode.Build(shapes, indices, ref nodes, ref nodeCount);
         }
         else
         {
-            // For very large datasets, fall back to array
             var indices = new int[shapes.Length];
             for (int i = 0; i < shapes.Length; i++)
                 indices[i] = i;
 
-            QBVH2dNode.Build(shapes, indices.AsSpan(), nodes, ref nodeCount);
+            rootEncoded = QBVH2dNode.Build(shapes, indices.AsSpan(), ref nodes, ref nodeCount);
         }
 
+        if (rootEncoded < 0)
+        {
+            // The whole tree is a single shape: QBVH2dNode.Build direct-encoded it without
+            // creating any node at all.
+            return new QBVH2d
+            {
+                Nodes = Array.Empty<QBVH2dNode>(),
+                NodeCount = 0,
+                RootLeafShapeIndex = ~rootEncoded,
+            };
+        }
+
+        if (nodeCount < nodes.Length)
+        {
+            Array.Resize(ref nodes, nodeCount);
+        }
 
         return new QBVH2d
         {
@@ -83,6 +109,10 @@ public class QBVH2d
     /// against custom shapes, debug visualization, or tree statistics). Start from
     /// <see cref="RootIndex"/> and use <see cref="QBVHNodeView.GetChildIndex"/> to descend.
     /// </summary>
+    /// <remarks>
+    /// Not valid when <see cref="RootLeafShapeIndex"/> is set (a single-shape tree has no
+    /// nodes) - check that first for custom traversals that need to handle every tree.
+    /// </remarks>
     /// <param name="index">Node index, in range [0, NodeCount)</param>
     /// <returns>A read-only view of the node</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -105,8 +135,7 @@ public class QBVH2d
     {
         List<int> results = new(16);
 
-        using var iterator = ContainsIterator(point);
-        foreach (var index in iterator)
+        foreach (var index in ContainsIterator(point))
         {
             results.Add(index);
         }
@@ -124,8 +153,7 @@ public class QBVH2d
     {
         int count = 0;
 
-        using var iterator = ContainsIterator(point);
-        foreach (var index in iterator)
+        foreach (var index in ContainsIterator(point))
         {
             if (count < results.Length)
             {
@@ -147,8 +175,7 @@ public class QBVH2d
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void QueryPoint(Vector2 point, ref List<int> results)
     {
-        using var iterator = ContainsIterator(point);
-        foreach (var index in iterator)
+        foreach (var index in ContainsIterator(point))
         {
             results.Add(index);
         }
@@ -162,40 +189,113 @@ public class QBVH2d
     public List<int> QueryAABB(AABB aabb)
     {
         List<int> results = new(32);
-        QueryAABBRecursive(0, aabb, results);
+
+        if (RootLeafShapeIndex >= 0)
+        {
+            results.Add(RootLeafShapeIndex);
+            return results;
+        }
+
+        if (NodeCount == 0) return results;
+
+        const int InitialCapacity = 64;
+        int[] stack = ArrayPool<int>.Shared.Rent(InitialCapacity);
+        try
+        {
+            int sp = 0;
+            stack[sp++] = RootIndex;
+
+            // Every entry on this stack is an internal node index: direct-encoded leaves are
+            // resolved straight from the parent's mask below and never pushed.
+            while (sp > 0)
+            {
+                int nodeIndex = stack[--sp];
+                ref var node = ref Nodes[nodeIndex];
+
+                node.GetChildBoundsSoA(out var minX, out var minY, out var maxX, out var maxY);
+                int intersectsMask = AABB.Intersects4(in aabb, minX, minY, maxX, maxY);
+                int mask = intersectsMask & node.Flags & 0xF;
+
+                while (mask != 0)
+                {
+                    int bit = BitOperations.TrailingZeroCount(mask);
+                    mask &= mask - 1;
+
+                    if (node.IsChildLeaf(bit))
+                    {
+                        results.Add(node.GetChildIndex(bit));
+                        continue;
+                    }
+
+                    if (sp == stack.Length)
+                    {
+                        var bigger = ArrayPool<int>.Shared.Rent(stack.Length * 2);
+                        stack.AsSpan(0, sp).CopyTo(bigger);
+                        ArrayPool<int>.Shared.Return(stack);
+                        stack = bigger;
+                    }
+
+                    stack[sp++] = node.GetChildIndex(bit);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(stack);
+        }
+
         return results;
     }
 
-    private void QueryAABBRecursive(int nodeIndex, AABB queryAABB, List<int> results)
+    /// <summary>
+    /// Checks whether any shape's AABB intersects the given query AABB, stopping at the first hit
+    /// without allocating a result list. Use this instead of <see cref="QueryAABB"/> when only the
+    /// presence of an intersection matters (e.g. obstacle/occupancy checks), since it avoids the
+    /// list allocation and returns as soon as one match is found.
+    /// </summary>
+    /// <param name="aabb">The AABB to query</param>
+    /// <returns><see langword="true"/> if at least one shape's AABB intersects <paramref name="aabb"/></returns>
+    public bool QueryAABBAny(AABB aabb)
     {
-        if (nodeIndex >= NodeCount) return;
+        if (RootLeafShapeIndex >= 0) return true;
+        if (NodeCount == 0) return false;
 
-        ref var node = ref Nodes[nodeIndex];
+        int[] stack = ArrayPool<int>.Shared.Rent(64);
+        try
+        {
+            int sp = 0;
+            stack[sp++] = RootIndex;
 
-        if (node.IsLeaf)
-        {
-            results.Add(node.ShapeIndex);
-            return;
-        }
+            while (sp > 0)
+            {
+                int nodeIndex = stack[--sp];
+                ref var node = ref Nodes[nodeIndex];
 
-        node.GetChildAABBRefs(out var aabb0, out var aabb1, out var aabb2, out var aabb3);
-        int intersectsMask = AABB.Intersects4(in queryAABB, in aabb0, in aabb1, in aabb2, in aabb3);
+                node.GetChildBoundsSoA(out var minX, out var minY, out var maxX, out var maxY);
+                int mask = AABB.Intersects4(in aabb, minX, minY, maxX, maxY) & node.Flags & 0xF;
 
-        if ((intersectsMask & 1) != 0 && node.HasChild(0))
-        {
-            QueryAABBRecursive(node.GetChildIndex(0), queryAABB, results);
+                while (mask != 0)
+                {
+                    int bit = BitOperations.TrailingZeroCount(mask);
+                    mask &= mask - 1;
+
+                    if (node.IsChildLeaf(bit)) return true;
+
+                    if (sp == stack.Length)
+                    {
+                        var bigger = ArrayPool<int>.Shared.Rent(stack.Length * 2);
+                        stack.AsSpan(0, sp).CopyTo(bigger);
+                        ArrayPool<int>.Shared.Return(stack);
+                        stack = bigger;
+                    }
+                    stack[sp++] = node.GetChildIndex(bit);
+                }
+            }
+            return false;
         }
-        if ((intersectsMask & 2) != 0 && node.HasChild(1))
+        finally
         {
-            QueryAABBRecursive(node.GetChildIndex(1), queryAABB, results);
-        }
-        if ((intersectsMask & 4) != 0 && node.HasChild(2))
-        {
-            QueryAABBRecursive(node.GetChildIndex(2), queryAABB, results);
-        }
-        if ((intersectsMask & 8) != 0 && node.HasChild(3))
-        {
-            QueryAABBRecursive(node.GetChildIndex(3), queryAABB, results);
+            ArrayPool<int>.Shared.Return(stack);
         }
     }
 
@@ -211,8 +311,7 @@ public class QBVH2d
     /// </param>
     /// <returns>An iterator over shape indices whose AABB the ray/segment intersects</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public QBVH2DRayIterator RayIterator(Vector2 origin, Vector2 direction, float maxT = float.PositiveInfinity) =>
-        new(this, origin, direction, maxT);
+    public QBVH2DRayIterator RayIterator(Vector2 origin, Vector2 direction, float maxT = float.PositiveInfinity) => new(this, origin, direction, maxT);
 
     /// <summary>
     /// Gets all shape indices whose AABB intersects the given ray or segment
@@ -225,8 +324,7 @@ public class QBVH2d
     {
         List<int> results = new(16);
 
-        using var iterator = RayIterator(origin, direction, maxT);
-        foreach (var index in iterator)
+        foreach (var index in RayIterator(origin, direction, maxT))
         {
             results.Add(index);
         }
@@ -246,8 +344,7 @@ public class QBVH2d
     {
         int count = 0;
 
-        using var iterator = RayIterator(origin, direction, maxT);
-        foreach (var index in iterator)
+        foreach (var index in RayIterator(origin, direction, maxT))
         {
             if (count < results.Length)
             {
@@ -271,8 +368,7 @@ public class QBVH2d
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void QueryRay(Vector2 origin, Vector2 direction, float maxT, ref List<int> results)
     {
-        using var iterator = RayIterator(origin, direction, maxT);
-        foreach (var index in iterator)
+        foreach (var index in RayIterator(origin, direction, maxT))
         {
             results.Add(index);
         }
@@ -290,39 +386,53 @@ public class QBVH2d
     /// <returns><see langword="true"/> if at least one shape's AABB blocks the segment</returns>
     public bool RaycastAny(Vector2 from, Vector2 to)
     {
+        if (RootLeafShapeIndex >= 0) return true;
         if (NodeCount == 0) return false;
 
         var direction = to - from;
         var invDir = AABB.InvDir(direction);
+        const float maxT = 1.0f;
 
-        // maxT = 1.0 because direction is the raw (unnormalized) displacement from
-        // "from" to "to", so t=1 corresponds exactly to the "to" endpoint
-        return RaycastAnyRecursive(0, from, invDir, 1.0f);
-    }
-
-    private bool RaycastAnyRecursive(int nodeIndex, Vector2 origin, Vector2 invDir, float maxT)
-    {
-        if (nodeIndex >= NodeCount) return false;
-
-        ref var node = ref Nodes[nodeIndex];
-
-        if (node.IsLeaf)
+        const int InitialCapacity = 64;
+        int[] stack = ArrayPool<int>.Shared.Rent(InitialCapacity);
+        try
         {
-            return true;
+            int sp = 0;
+            stack[sp++] = RootIndex;
+
+            while (sp > 0)
+            {
+                int nodeIndex = stack[--sp];
+                ref var node = ref Nodes[nodeIndex];
+
+                node.GetChildBoundsSoA(out var minX, out var minY, out var maxX, out var maxY);
+                int hitMask = AABB.IntersectsRay4(in from, in invDir, maxT, minX, minY, maxX, maxY);
+                int mask = hitMask & node.Flags & 0xF;
+
+                while (mask != 0)
+                {
+                    int bit = BitOperations.TrailingZeroCount(mask);
+                    mask &= mask - 1;
+
+                    if (node.IsChildLeaf(bit)) return true;
+
+                    if (sp == stack.Length)
+                    {
+                        var bigger = ArrayPool<int>.Shared.Rent(stack.Length * 2);
+                        stack.AsSpan(0, sp).CopyTo(bigger);
+                        ArrayPool<int>.Shared.Return(stack);
+                        stack = bigger;
+                    }
+
+                    stack[sp++] = node.GetChildIndex(bit);
+                }
+            }
+
+            return false;
         }
-
-        node.GetChildAABBRefs(out var aabb0, out var aabb1, out var aabb2, out var aabb3);
-        int hitMask = AABB.IntersectsRay4(in origin, in invDir, maxT, in aabb0, in aabb1, in aabb2, in aabb3);
-
-        if ((hitMask & 1) != 0 && node.HasChild(0) && RaycastAnyRecursive(node.GetChildIndex(0), origin, invDir, maxT))
-            return true;
-        if ((hitMask & 2) != 0 && node.HasChild(1) && RaycastAnyRecursive(node.GetChildIndex(1), origin, invDir, maxT))
-            return true;
-        if ((hitMask & 4) != 0 && node.HasChild(2) && RaycastAnyRecursive(node.GetChildIndex(2), origin, invDir, maxT))
-            return true;
-        if ((hitMask & 8) != 0 && node.HasChild(3) && RaycastAnyRecursive(node.GetChildIndex(3), origin, invDir, maxT))
-            return true;
-
-        return false;
+        finally
+        {
+            ArrayPool<int>.Shared.Return(stack);
+        }
     }
 }
